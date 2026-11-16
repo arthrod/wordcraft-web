@@ -27,9 +27,11 @@ commands:
   wasm            cargo check --target wasm32-unknown-unknown for the wasm-safe crates (one call)
   wasm-budget [--report-only]
                   check that dist/web/wordcraft-web*_bg.wasm meets the size and symbol budget
-  wasm-attr [--wasm <path>]
+  wasm-attr [--wasm <path>] [--top <N> [--bucket <name>]] [--trait-impls]
                   attribute the wordcraft-web wasm code section per crate (decides cold-code
-                  splitting); writes docs/plans/wasm-attribution.md
+                  splitting); writes docs/plans/wasm-attribution.md. --top lists the N largest
+                  functions (of one bucket with --bucket); --trait-impls shows `<A as B>::f`
+                  code under both crates. Those two only print; they leave the report alone
   brotli <input> <output>
                   Brotli-compress one file at quality 11 (packaging/web emits .wasm.br sidecars)
   web-assets      stage runtime i18n TSVs and demo samples into apps/wordcraft-web/target-assets

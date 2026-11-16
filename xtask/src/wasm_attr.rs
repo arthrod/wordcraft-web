@@ -1,4 +1,4 @@
-//! `cargo xtask wasm-attr [--wasm <path>]`: attribute the WASM code section of the
+//! `cargo xtask wasm-attr [--wasm <path>] [--top <N> [--bucket <name>]] [--trait-impls]`: attribute the WASM code section of the
 //! `wordcraft-web` build per crate, to decide whether cold-code splitting is worth it.
 //!
 //! The `wasm-release` profile sets `strip = "symbols"`, which removes the `name` custom
@@ -38,6 +38,32 @@ pub struct Bucket {
     pub funcs: usize,
 }
 
+/// One function body: its encoded size, its primary bucket, and for a trait-impl symbol
+/// (`<A as B>::f`) the bucket of the trait's crate when that is a different crate.
+#[derive(Debug)]
+pub struct Func {
+    pub bytes: usize,
+    pub bucket: String,
+    /// Secondary attribution only: never added to a bucket's primary bytes.
+    pub also: Option<String>,
+    /// Full demangled name (or a placeholder for a body without a name entry).
+    pub name: String,
+}
+
+/// Trait-impl cross-attribution for one bucket. Both figures are views of bytes already
+/// counted once in the primary table; neither is added to any total.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TraitImpls {
+    pub name: String,
+    /// Bytes (and functions) whose primary bucket is this one and that implement another
+    /// crate's trait.
+    pub foreign_bytes: usize,
+    pub foreign_funcs: usize,
+    /// Bytes (and functions) primarily in other buckets that implement this crate's traits.
+    pub also_bytes: usize,
+    pub also_funcs: usize,
+}
+
 #[derive(Debug)]
 pub struct Attribution {
     pub path: PathBuf,
@@ -49,6 +75,8 @@ pub struct Attribution {
     pub functions: usize,
     /// Sorted by bytes descending, then name.
     pub buckets: Vec<Bucket>,
+    /// Every function body, in code-section order.
+    pub funcs: Vec<Func>,
 }
 
 /// Read a length-prefixed UTF-8 name whose bytes must end within `end`.
@@ -261,8 +289,12 @@ fn second_segment(demangled: &str) -> &str {
 
 /// Demangle and attribute one symbol. Symbols that demangle to a single word carry no
 /// crate path (C shims, link-time thunks), so they land in `other`.
+#[cfg(test)]
 fn bucket_for_name(mangled: &str) -> String {
-    let demangled = rustc_demangle::demangle(mangled).to_string();
+    bucket_for_demangled(&rustc_demangle::demangle(mangled).to_string())
+}
+
+fn bucket_for_demangled(demangled: &str) -> String {
     if !demangled.contains("::") {
         return "other".into();
     }
@@ -270,37 +302,121 @@ fn bucket_for_name(mangled: &str) -> String {
     // region, so they are measured apart from the rest of the UI crate rather than claimed.
     // The first segment carries a v0 disambiguator hash in mangled form
     // (`wordcraft_ui_egui[6c571ced…]::dialogs`), so compare it stripped, as the crate buckets do.
-    let first = first_crate_segment(&demangled);
-    if first.split('[').next().unwrap_or(first) == "wordcraft_ui_egui" && second_segment(&demangled) == "dialogs" {
+    let first = first_crate_segment(demangled);
+    if first.split('[').next().unwrap_or(first) == "wordcraft_ui_egui" && second_segment(demangled) == "dialogs" {
         return "wordcraft-ui-egui::dialogs".into();
     }
-    normalize_bucket(first_crate_segment(&demangled))
+    normalize_bucket(first)
 }
 
-/// Attribute each function entry to a bucket by its name in the function-name map;
-/// functions without a name entry (or with an unusable one) go to `other`.
+/// The trait path of a `<A as B>::f` symbol: the text between the ` as ` at angle-bracket
+/// depth 1 and the `>` that closes the leading `<`. Nested generics on either side
+/// (`<a::T<x::U<V>> as b::Tr<W>>::f`) and `->` in function types do not end it early.
+fn trait_path(demangled: &str) -> Option<&str> {
+    let body = demangled.strip_prefix('<')?;
+    let mut depth = 1usize;
+    let mut trait_start = None;
+    let mut prev = 0u8;
+    for (i, b) in body.bytes().enumerate() {
+        match b {
+            b'<' => depth = depth.saturating_add(1),
+            // `->` is a function-type arrow, not a closing bracket
+            b'>' if prev != b'-' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return body.get(trait_start?..i);
+                }
+            }
+            b' ' if depth == 1 && body.get(i..).is_some_and(|rest| rest.starts_with(" as ")) => trait_start = Some(i.saturating_add(4)),
+            _ => {}
+        }
+        prev = b;
+    }
+    None
+}
+
+/// The bucket of the trait's crate for a trait-impl symbol, when it names a crate other
+/// than the one the symbol is primarily attributed to.
+fn also_bucket(demangled: &str) -> Option<String> {
+    let also = normalize_bucket(first_crate_segment(trait_path(demangled)?));
+    (also != "other" && also != normalize_bucket(first_crate_segment(demangled))).then_some(also)
+}
+
+/// Classify each function entry by its name in the function-name map; functions without a
+/// name entry (or with an unusable one) go to `other`.
 /// `imported_funcs` is the number of imported functions: the name map's indices cover
 /// imports first, while `sizes` holds only the code section's defined-function bodies,
 /// so body `i` is function index `i + imported_funcs`.
-pub fn attribute(sizes: &[usize], names: &[(u32, String)], imported_funcs: u64) -> Vec<Bucket> {
+pub fn classify(sizes: &[usize], names: &[(u32, String)], imported_funcs: u64) -> Vec<Func> {
     let mut map: BTreeMap<u32, &str> = BTreeMap::new();
     for (idx, name) in names {
         map.insert(*idx, name.as_str());
     }
-    let mut buckets: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for (i, &size) in sizes.iter().enumerate() {
+    let mut funcs = Vec::new();
+    for (i, &bytes) in sizes.iter().enumerate() {
         // Function indices come from a u32 count in the code section plus the import
         // count, so try_from cannot fail in practice — but hostile bytes never get to
         // panic on the conversion.
         let idx = u64::try_from(i).ok().and_then(|i| i.checked_add(imported_funcs)).and_then(|i| u32::try_from(i).ok());
-        let bucket = idx.and_then(|idx| map.get(&idx)).map_or_else(|| "other".to_string(), |n| bucket_for_name(n));
-        let entry = buckets.entry(bucket).or_insert((0, 0));
-        entry.0 = entry.0.saturating_add(size);
+        funcs.push(match idx.and_then(|idx| map.get(&idx)) {
+            Some(mangled) => {
+                let name = rustc_demangle::demangle(mangled).to_string();
+                Func { bytes, bucket: bucket_for_demangled(&name), also: also_bucket(&name), name }
+            }
+            None => Func { bytes, bucket: "other".into(), also: None, name: format!("<unnamed function body {i}>") },
+        });
+    }
+    funcs
+}
+
+/// Sum the classified functions per primary bucket: heaviest first, then by name.
+pub fn attribute(funcs: &[Func]) -> Vec<Bucket> {
+    let mut buckets: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for f in funcs {
+        let entry = buckets.entry(f.bucket.as_str()).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(f.bytes);
         entry.1 = entry.1.saturating_add(1);
     }
-    let mut buckets: Vec<Bucket> = buckets.into_iter().map(|(name, (bytes, funcs))| Bucket { name, bytes, funcs }).collect();
+    let mut buckets: Vec<Bucket> = buckets.into_iter().map(|(name, (bytes, funcs))| Bucket { name: name.to_string(), bytes, funcs }).collect();
     buckets.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
     buckets
+}
+
+/// Trait-impl cross-attribution per bucket (see [`TraitImpls`]), largest combined figure
+/// first, then by name. Buckets with no trait-impl bytes either way are left out.
+pub fn trait_impls(funcs: &[Func]) -> Vec<TraitImpls> {
+    fn row<'m>(map: &'m mut BTreeMap<String, TraitImpls>, name: &str) -> &'m mut TraitImpls {
+        map.entry(name.to_string()).or_insert_with(|| TraitImpls {
+            name: name.to_string(),
+            foreign_bytes: 0,
+            foreign_funcs: 0,
+            also_bytes: 0,
+            also_funcs: 0,
+        })
+    }
+    let mut map: BTreeMap<String, TraitImpls> = BTreeMap::new();
+    for f in funcs {
+        let Some(also) = f.also.as_deref() else { continue };
+        let own = row(&mut map, &f.bucket);
+        own.foreign_bytes = own.foreign_bytes.saturating_add(f.bytes);
+        own.foreign_funcs = own.foreign_funcs.saturating_add(1);
+        let other = row(&mut map, also);
+        other.also_bytes = other.also_bytes.saturating_add(f.bytes);
+        other.also_funcs = other.also_funcs.saturating_add(1);
+    }
+    let mut rows: Vec<TraitImpls> = map.into_values().collect();
+    let weight = |r: &TraitImpls| r.foreign_bytes.saturating_add(r.also_bytes);
+    rows.sort_by(|a, b| weight(b).cmp(&weight(a)).then_with(|| a.name.cmp(&b.name)));
+    rows
+}
+
+/// The `n` largest functions, largest first (ties by name), optionally only those whose
+/// primary bucket is `bucket`.
+pub fn top_functions<'a>(funcs: &'a [Func], bucket: Option<&str>, n: usize) -> Vec<&'a Func> {
+    let mut rows: Vec<&Func> = funcs.iter().filter(|f| bucket.is_none_or(|b| f.bucket == b)).collect();
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+    rows.truncate(n);
+    rows
 }
 
 fn strip_error(path: &Path) -> String {
@@ -367,8 +483,17 @@ pub fn analyze(path: PathBuf, bytes: &[u8]) -> Result<Attribution, String> {
     let sizes = parse_code_section(bytes, code_start, code_end)?;
     let functions = sizes.len();
     let function_bytes = sizes.iter().fold(0usize, |acc, s| acc.saturating_add(*s));
-    let buckets = attribute(&sizes, &names, imported_funcs);
-    Ok(Attribution { path, wasm_bytes: bytes.len(), code_section_bytes: code_end.saturating_sub(code_start), function_bytes, functions, buckets })
+    let funcs = classify(&sizes, &names, imported_funcs);
+    let buckets = attribute(&funcs);
+    Ok(Attribution {
+        path,
+        wasm_bytes: bytes.len(),
+        code_section_bytes: code_end.saturating_sub(code_start),
+        function_bytes,
+        functions,
+        buckets,
+        funcs,
+    })
 }
 
 /// Bytes in buckets matching `pred` (used for the plan-focused group summary).
@@ -413,6 +538,45 @@ fn render_text(a: &Attribution) -> String {
     out
 }
 
+/// The `--top` view: one row per function, full demangled name last so nothing is cut.
+fn render_top(a: &Attribution, n: usize, bucket: Option<&str>) -> String {
+    let scope = bucket.map_or_else(|| "all buckets".to_string(), |b| format!("`{b}`"));
+    let (count, bytes) = a
+        .funcs
+        .iter()
+        .filter(|f| bucket.is_none_or(|b| f.bucket == b))
+        .fold((0usize, 0usize), |(c, s), f| (c.saturating_add(1), s.saturating_add(f.bytes)));
+    let rows = top_functions(&a.funcs, bucket, n);
+    let mut out = format!("top {} of {count} functions in {scope} ({bytes} bytes), largest first:\n", rows.len());
+    out.push_str(&format!("{:>10}  {:<28} {:<20} name\n", "bytes", "bucket", "also (trait crate)"));
+    for f in rows {
+        out.push_str(&format!("{:>10}  {:<28} {:<20} {}\n", f.bytes, f.bucket, f.also.as_deref().unwrap_or("-"), f.name));
+    }
+    out
+}
+
+/// The `--trait-impls` view: per bucket, the primary bytes next to both trait-impl figures.
+fn render_trait_impls(a: &Attribution) -> String {
+    let mut out = String::from(
+        "trait impls (`<A as B>::f`) across crates. Primary bytes count each function once, under A's crate.\n\
+         `impls of foreign traits` is the part of that primary figure whose trait B is another crate's;\n\
+         `also attributed` is code counted under other buckets that implements this crate's traits.\n\
+         Neither is added to any total.\n\n",
+    );
+    out.push_str(&format!(
+        "{:<34} {:>12} {:>24} {:>7} {:>16} {:>7}\n",
+        "bucket", "primary", "impls of foreign traits", "funcs", "also attributed", "funcs"
+    ));
+    for r in trait_impls(&a.funcs) {
+        let primary = a.buckets.iter().find(|b| b.name == r.name).map_or(0, |b| b.bytes);
+        out.push_str(&format!(
+            "{:<34} {:>12} {:>24} {:>7} {:>16} {:>7}\n",
+            r.name, primary, r.foreign_bytes, r.foreign_funcs, r.also_bytes, r.also_funcs
+        ));
+    }
+    out
+}
+
 fn render_markdown(a: &Attribution, date: &str) -> String {
     let mut out = String::new();
     out.push_str("# WASM code-section attribution (`wordcraft-web`)\n\n");
@@ -440,22 +604,52 @@ fn render_markdown(a: &Attribution, date: &str) -> String {
     out
 }
 
-/// `--wasm <path>` or none; anything else is a usage error.
-fn parse_args(args: &[&str]) -> Result<Option<PathBuf>, String> {
-    const USAGE: &str = "usage: cargo xtask wasm-attr [--wasm <path>]";
-    let mut wasm = None;
+/// Parsed arguments. `top` and `trait_impls` are queries: they print their view and leave
+/// the report file alone.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Opts {
+    wasm: Option<PathBuf>,
+    top: Option<usize>,
+    bucket: Option<String>,
+    trait_impls: bool,
+}
+
+/// `--wasm <path>`, `--top <N> [--bucket <name>]`, `--trait-impls`; anything else is a
+/// usage error.
+fn parse_args(args: &[&str]) -> Result<Opts, String> {
+    const USAGE: &str = "usage: cargo xtask wasm-attr [--wasm <path>] [--top <N> [--bucket <name>]] [--trait-impls]";
+    let mut opts = Opts::default();
     let mut i = 0usize;
     while let Some(arg) = args.get(i) {
         match *arg {
             "--wasm" => {
                 let value = args.get(i + 1).ok_or_else(|| format!("--wasm needs a path\n{USAGE}"))?;
-                wasm = Some(PathBuf::from(value));
+                opts.wasm = Some(PathBuf::from(value));
                 i += 2;
+            }
+            "--top" => {
+                let value = args.get(i + 1).ok_or_else(|| format!("--top needs a count\n{USAGE}"))?;
+                let n =
+                    value.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("--top needs a positive count, got `{value}`\n{USAGE}"))?;
+                opts.top = Some(n);
+                i += 2;
+            }
+            "--bucket" => {
+                let value = args.get(i + 1).ok_or_else(|| format!("--bucket needs a bucket name\n{USAGE}"))?;
+                opts.bucket = Some((*value).to_string());
+                i += 2;
+            }
+            "--trait-impls" => {
+                opts.trait_impls = true;
+                i += 1;
             }
             other => return Err(format!("unknown argument `{other}`\n{USAGE}")),
         }
     }
-    Ok(wasm)
+    if opts.bucket.is_some() && opts.top.is_none() {
+        return Err(format!("--bucket filters the --top listing and needs it\n{USAGE}"));
+    }
+    Ok(opts)
 }
 
 /// Rebuild the wasm unstripped (the env var keeps the `name` section) and return the
@@ -491,12 +685,22 @@ fn utc_date() -> String {
 }
 
 pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
-    let wasm_path = match parse_args(args)? {
+    let opts = parse_args(args)?;
+    let wasm_path = match opts.wasm {
         Some(p) => p,
         None => build_and_find()?,
     };
     let bytes = std::fs::read(&wasm_path).map_err(|e| format!("{}: {e}", wasm_path.display()))?;
     let attribution = analyze(wasm_path, &bytes)?;
+    if opts.top.is_some() || opts.trait_impls {
+        if opts.trait_impls {
+            print!("{}", render_trait_impls(&attribution));
+        }
+        if let Some(n) = opts.top {
+            print!("{}", render_top(&attribution, n, opts.bucket.as_deref()));
+        }
+        return Ok(());
+    }
     print!("{}", render_text(&attribution));
     let report = root.join(REPORT_REL);
     if let Some(parent) = report.parent() {
@@ -749,9 +953,112 @@ mod tests {
 
     #[test]
     fn parse_args_takes_exactly_one_wasm_path() {
-        assert!(parse_args(&[]).unwrap().is_none());
-        assert_eq!(parse_args(&["--wasm", "/tmp/a.wasm"]).unwrap(), Some(PathBuf::from("/tmp/a.wasm")));
+        assert!(parse_args(&[]).unwrap().wasm.is_none());
+        assert_eq!(parse_args(&["--wasm", "/tmp/a.wasm"]).unwrap().wasm, Some(PathBuf::from("/tmp/a.wasm")));
         assert!(parse_args(&["--wasm"]).is_err());
         assert!(parse_args(&["--wasm", "a", "extra"]).is_err());
+    }
+
+    #[test]
+    fn parse_args_takes_top_bucket_and_trait_impls() {
+        assert_eq!(parse_args(&[]).unwrap(), Opts::default());
+        let o = parse_args(&["--top", "50", "--bucket", "web_sys", "--wasm", "a.wasm", "--trait-impls"]).unwrap();
+        assert_eq!(o, Opts { wasm: Some(PathBuf::from("a.wasm")), top: Some(50), bucket: Some("web_sys".into()), trait_impls: true });
+        assert!(parse_args(&["--top"]).is_err());
+        assert!(parse_args(&["--top", "many"]).is_err());
+        assert!(parse_args(&["--top", "-1"]).is_err());
+        assert!(parse_args(&["--top", "0"]).is_err());
+        assert!(parse_args(&["--bucket"]).is_err());
+        // a bucket filter without a listing to filter is a mistake, not a silent no-op
+        assert!(parse_args(&["--bucket", "web_sys"]).is_err());
+    }
+
+    #[test]
+    fn trait_path_survives_nested_generics_and_fn_arrows() {
+        assert_eq!(trait_path("<web_sys::T as wasm_bindgen::convert::FromWasmAbi>::from_abi"), Some("wasm_bindgen::convert::FromWasmAbi"));
+        assert_eq!(trait_path("<a::T<x::U<V>> as b::Tr<W<X>>>::f::{{closure}}"), Some("b::Tr<W<X>>"));
+        assert_eq!(trait_path("<dyn core::ops::Fn(A) -> R<S> as b::Tr>::f"), Some("b::Tr"));
+        // the inner `as` belongs to the self type, the outer one names the trait
+        assert_eq!(trait_path("<<a::T as b::Iter>::Item as c::Tr>::f"), Some("c::Tr"));
+        assert_eq!(trait_path("<a::T>::f"), None);
+        assert_eq!(trait_path("a::b::f"), None);
+        assert_eq!(trait_path("<a::T as b::Tr"), None);
+        assert_eq!(trait_path("<"), None);
+        assert_eq!(trait_path(""), None);
+    }
+
+    /// The V3 question: a `<A as B>::f` body stays wholly in A's bucket for the primary table,
+    /// and is reported a second time under B's crate without entering any total.
+    #[test]
+    fn trait_impls_are_counted_under_both_crates_without_double_counting() {
+        let bytes = wasm_bytes(&[
+            section(10, &code_payload(&[10, 20, 5, 7, 3])),
+            name_section(&[
+                (0, "<web_sys::T as wasm_bindgen::convert::FromWasmAbi>::from_abi"),
+                (1, "<web_sys::Foo<core::cell::Cell<u8>> as serde::Serialize>::serialize::{{closure}}"),
+                (2, "web_sys::plain::f"),
+                // an impl of the crate's own trait is not cross-crate
+                (3, "<web_sys::T as web_sys::Tr>::g"),
+                (4, "<usize as wasm_bindgen::convert::IntoWasmAbi>::into_abi"),
+            ]),
+        ]);
+        let a = analyze(PathBuf::from("t.wasm"), &bytes).unwrap();
+        // primary table: exactly as before, every byte counted once
+        let bucket = |n: &str| a.buckets.iter().find(|b| b.name == n).map(|b| (b.bytes, b.funcs));
+        assert_eq!(bucket("web_sys"), Some((11 + 21 + 6 + 8, 4)));
+        assert_eq!(bucket("other"), Some((4, 1)));
+        assert_eq!(bucket("wasm_bindgen"), None);
+        assert_eq!(bucket("serde"), None);
+        assert_eq!(a.buckets.iter().map(|b| b.bytes).sum::<usize>(), a.function_bytes);
+        // secondary figures
+        let row = |name: &str, foreign: (usize, usize), also: (usize, usize)| TraitImpls {
+            name: name.into(),
+            foreign_bytes: foreign.0,
+            foreign_funcs: foreign.1,
+            also_bytes: also.0,
+            also_funcs: also.1,
+        };
+        assert_eq!(
+            trait_impls(&a.funcs),
+            vec![row("web_sys", (32, 2), (0, 0)), row("serde", (0, 0), (21, 1)), row("wasm_bindgen", (0, 0), (15, 2)), row("other", (4, 1), (0, 0))]
+        );
+        let text = render_trait_impls(&a);
+        assert!(text.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == ["web_sys", "46", "32", "2", "0", "0"]), "{text}");
+        assert!(text.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == ["serde", "0", "0", "0", "21", "1"]), "{text}");
+        // the default table is unaffected
+        assert!(!render_text(&a).contains("serde"));
+    }
+
+    #[test]
+    fn top_functions_lists_the_largest_first_with_full_names() {
+        let bytes = wasm_bytes(&[
+            section(10, &code_payload(&[10, 20, 5, 20, 30])),
+            name_section(&[
+                (0, "web_sys::small"),
+                (1, "<web_sys::T as wasm_bindgen::closure::WasmClosure>::describe::{{closure}}"),
+                (2, "_ZN6js_sys7Reflect3get17h0123456789abcdefE"),
+                (3, "web_sys::a_tie"),
+            ]),
+        ]);
+        let a = analyze(PathBuf::from("t.wasm"), &bytes).unwrap();
+        let rows = |bucket: Option<&str>, n: usize| top_functions(&a.funcs, bucket, n).iter().map(|f| (f.bytes, f.name.as_str())).collect::<Vec<_>>();
+        assert_eq!(
+            rows(None, 3),
+            vec![
+                (31, "<unnamed function body 4>"),
+                (21, "<web_sys::T as wasm_bindgen::closure::WasmClosure>::describe::{{closure}}"),
+                (21, "web_sys::a_tie")
+            ]
+        );
+        assert_eq!(rows(Some("web_sys"), 2).len(), 2);
+        assert_eq!(rows(Some("web_sys"), 99).iter().map(|r| r.0).collect::<Vec<_>>(), vec![21, 21, 11]);
+        assert_eq!(rows(Some("js_sys"), 5), vec![(6, "js_sys::Reflect::get::h0123456789abcdef")]);
+        assert!(rows(Some("no_such_bucket"), 5).is_empty());
+        let text = render_top(&a, 2, Some("web_sys"));
+        let body: Vec<&str> = text.lines().skip(2).collect();
+        assert_eq!(body.len(), 2, "{text}");
+        assert!(body[0].ends_with("<web_sys::T as wasm_bindgen::closure::WasmClosure>::describe::{{closure}}"), "{text}");
+        assert!(body[0].contains("wasm_bindgen "), "the secondary bucket is shown: {text}");
+        assert!(text.starts_with("top 2 of 3 functions in `web_sys` (53 bytes)"), "{text}");
     }
 }
