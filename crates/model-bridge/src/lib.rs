@@ -72,11 +72,15 @@ impl std::error::Error for Error {}
 /// `fit_state` is left empty; it is not part of the shared model (`wordcraft-docx` reads it from
 /// a custom XML part).
 ///
-/// A document nested deeper than the limits in `nesting.rs` is refused, and taken apart without
-/// recursing.
+/// A document nested deeper than the limits in `nesting.rs` is refused, and leaked: see below.
 pub fn from_shared(source: craft_wordmodel::Document) -> Result<wordcraft_doc::Document, Error> {
     if !nesting::shared::within(&source) {
-        nesting::shared::dismantle(source);
+        // Dropping it would recurse as deep as it nests and overflow the stack, which is what
+        // refusing it prevents. No reader makes such a document (they stop well inside the
+        // limits), so leaking it is the safe outcome for a value that should not exist, and costs
+        // less than code to take it apart. `to_shared` borrows, so a refused document there stays
+        // the caller's.
+        std::mem::forget(source);
         return Err(Error::TooDeep);
     }
     session::checked(|| stories::document_from_shared(source))

@@ -126,8 +126,10 @@ fn write(nesting: Nesting) -> Vec<(&'static str, Result<(), Error>)> {
             .into_iter()
             .map(|(story, document)| {
                 let written = to_shared(&document).map(drop);
-                // Dropping a document nested too deep recurses too: this measures the bridge, not `Drop`.
-                crate::nesting::own::dismantle(document);
+                // Dropping a document nested this deep recurses as deep as it nests and would
+                // overflow here: this measures the bridge, not `Drop`, so the document is leaked
+                // (as `from_shared` leaks one it refuses).
+                std::mem::forget(document);
                 (story, written)
             })
             .collect()

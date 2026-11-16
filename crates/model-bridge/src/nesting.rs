@@ -51,7 +51,7 @@ impl Depth {
     }
 }
 
-/// The walk and the iterative teardown, for one model; the two models are twins.
+/// The walk, for one model; the two models are twins.
 macro_rules! nesting {
     ($name:ident, $model:ident) => {
         pub(crate) mod $name {
@@ -139,69 +139,6 @@ macro_rules! nesting {
                     MNode::Matrix { rows, .. } => (Vec::new(), rows.as_slice()),
                 };
                 lists.into_iter().chain(rows.iter().flatten().map(Vec::as_slice))
-            }
-
-            /// Drops `document` without recursing: a document nested too deep to convert is too deep
-            /// for the recursive `Drop` too. Its blocks, objects and equation nodes are taken out
-            /// onto lists and dropped one level at a time.
-            #[cfg_attr(not(test), allow(dead_code, reason = "WordCraft's documents are borrowed, not consumed; the tests use it"))]
-            pub(crate) fn dismantle(document: m::Document) {
-                let m::Document { body, parts, footnote_separators, endnote_separators, glossary, .. } = document;
-                let mut blocks: Vec<Arc<m::Block>> = body;
-                blocks.extend(parts.into_values().flat_map(|part| part.blocks));
-                for separators in [footnote_separators, endnote_separators] {
-                    let m::NoteSeparators { separator, continuation_separator, continuation_notice } = separators;
-                    blocks.extend([separator, continuation_separator, continuation_notice].into_iter().flatten().flatten());
-                }
-                blocks.extend(glossary.into_iter().flat_map(|entry| entry.blocks));
-
-                let mut objects: Vec<InlineObject> = Vec::new();
-                let mut nodes: Vec<MNode> = Vec::new();
-                loop {
-                    if let Some(block) = blocks.pop() {
-                        // A block another document still points to is only released here.
-                        match Arc::into_inner(block) {
-                            Some(m::Block::Para(paragraph)) => objects.extend(paragraph.objects),
-                            Some(m::Block::Table(table)) => {
-                                blocks.extend(table.rows.into_iter().flat_map(|row| row.cells).flat_map(|cell| cell.blocks))
-                            }
-                            None => {}
-                        }
-                    } else if let Some(object) = objects.pop() {
-                        // Only these two hold more of the tree; see `object`.
-                        match object {
-                            InlineObject::Group { children, .. } => objects.extend(children.into_iter().map(|child| child.obj)),
-                            InlineObject::Equation { math, .. } => nodes.extend(math.nodes),
-                            _ => {}
-                        }
-                    } else if let Some(node) = nodes.pop() {
-                        take_args(node, &mut nodes);
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            /// Moves a node's arguments' nodes onto `out`.
-            fn take_args(node: MNode, out: &mut Vec<MNode>) {
-                match node {
-                    MNode::Run(_) => {}
-                    MNode::Frac { num, den, .. } => out.extend(num.into_iter().chain(den)),
-                    MNode::Script { base, sub, sup, .. } => out.extend(base.into_iter().chain(sub).chain(sup)),
-                    MNode::Rad { deg, e, .. } => out.extend(deg.into_iter().chain(e)),
-                    MNode::Nary { sub, sup, e, .. } => out.extend(sub.into_iter().chain(sup).chain(e)),
-                    MNode::Delim { elems, .. } => out.extend(elems.into_iter().flatten()),
-                    MNode::Func { name, e } => out.extend(name.into_iter().chain(e)),
-                    MNode::Lim { e, lim, .. } => out.extend(e.into_iter().chain(lim)),
-                    MNode::Acc { e, .. }
-                    | MNode::Bar { e, .. }
-                    | MNode::BorderBox { e, .. }
-                    | MNode::Boxed { e }
-                    | MNode::GroupChr { e, .. }
-                    | MNode::Phant { e, .. } => out.extend(e),
-                    MNode::EqArr { rows } => out.extend(rows.into_iter().flatten()),
-                    MNode::Matrix { rows, .. } => out.extend(rows.into_iter().flatten().flatten()),
-                }
             }
         }
     };
